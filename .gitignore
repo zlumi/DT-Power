@@ -1,0 +1,9 @@
+results/*
+results_1min/*
+
+!results/.gitkeep
+!results_1min/.gitkeep
+
+# these files are too big to be stored in git
+pickles/1min/all_open_interest.pkl
+pickles/1min/all_transaction_hist.pkl
