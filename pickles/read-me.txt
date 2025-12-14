@@ -1,9 +1,0 @@
-multiple types of csv in results.zip.
-
-order_raw: raw order data from the input
-open_interest: un-matched order at the snapshot time
-agg_open_interest: processed open interests that combines the same direction and same prices and remove the order ID
-transactions: matched order in the previous snapshot to this snapshot
-hist_transactions: all historical transactions until this snapshot
-
-most important files are open_interest and transactions
