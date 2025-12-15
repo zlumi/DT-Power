@@ -3,19 +3,11 @@ import pandas as pd
 import plotly.graph_objects as go
 from replay_engine import ReplayEngine
 import datetime
+from config import FILEPATH, PAGE_LAYOUT
+from utils import load_engine
 
 # --- Constants & Config ---
-FILEPATH = r"c:\Users\hankz\Documents\GitHub\DT-Power\data\Continuous_Orders-NL-20210626-20210628T042947000Z.csv"
-
-st.set_page_config(layout="wide", page_title="Order Book Replay")
-
-# --- Data Loading ---
-@st.cache_resource
-def load_engine():
-    engine = ReplayEngine(FILEPATH)
-    engine.load_data()
-    engine.precompute_ticker()
-    return engine
+st.set_page_config(layout=PAGE_LAYOUT, page_title="Order Book Replay")
 
 # --- State Management ---
 def init_session_state(min_time, max_time):
@@ -43,15 +35,14 @@ def update_manual_callback(min_time, max_time):
         e_dt = datetime.datetime.combine(st.session_state.e_date, st.session_state.e_time).replace(tzinfo=datetime.timezone.utc)
 
         if s_dt > e_dt:
-            st.sidebar.error("Start time cannot be after end time")
+            st.warning("Start time must be before end time.")
         else:
-            # Clamp to min/max
-            s_dt = max(min_time, min(s_dt, max_time))
-            e_dt = max(min_time, min(e_dt, max_time))
             st.session_state.replay_start = s_dt
             st.session_state.replay_end = e_dt
+            # Update slider to match manual input
+            st.session_state.time_slider = (s_dt, e_dt)
     except Exception:
-        pass
+        st.error("Invalid date or time input.")
 
 def update_fragmented_callback():
     st.session_state.include_fragmented = st.session_state.include_fragmented_checkbox
@@ -59,7 +50,7 @@ def update_fragmented_callback():
 # --- UI Components ---
 def render_time_controls(min_time, max_time):
     st.sidebar.header("Replay Controls")
-    
+
     # Slider
     st.sidebar.slider(
         "Replay Time Range",
@@ -78,7 +69,7 @@ def render_time_controls(min_time, max_time):
         c1, c2 = st.columns(2)
         c1.date_input("Date", value=st.session_state.replay_start.date(), min_value=min_time.date(), max_value=max_time.date(), key='s_date', on_change=lambda: update_manual_callback(min_time, max_time))
         c2.time_input("Time", value=st.session_state.replay_start.time(), step=60, key='s_time', on_change=lambda: update_manual_callback(min_time, max_time))
-        
+
         st.caption("End Time")
         c3, c4 = st.columns(2)
         c3.date_input("Date", value=st.session_state.replay_end.date(), min_value=min_time.date(), max_value=max_time.date(), key='e_date', on_change=lambda: update_manual_callback(min_time, max_time))
@@ -122,13 +113,14 @@ def render_y_axis_controls(history, selected_products, start_time, end_time):
     else:
         relevant_history = history
 
+    # Default range
+    price_min = -50
+    price_max = 300
+
     # Calculate the minimum and maximum of the entire price series
     if not relevant_history.empty:
-        price_min = int(min(relevant_history['BestBid'].min(), relevant_history['BestAsk'].min()))
-        price_max = int(max(relevant_history['BestBid'].max(), relevant_history['BestAsk'].max()))
-    else:
-        price_min = 0
-        price_max = 1000
+        price_min = int(min(price_min, relevant_history['BestBid'].min(), relevant_history['BestAsk'].min()))
+        price_max = int(max(price_max, relevant_history['BestBid'].max(), relevant_history['BestAsk'].max()))
 
     # Ensure valid range for slider
     if price_max <= price_min:
@@ -144,48 +136,32 @@ def render_y_axis_controls(history, selected_products, start_time, end_time):
     )
     return y_min, y_max
 
-def render_chart(product, history, snapshot, window_minutes, include_fragmented, y_range, end_time):
+def render_chart(product, history, snapshot, window_minutes, include_fragmented, y_range, end_time, p_orders):
     # Filter history for this product (time series of precomputed bests)
-    p_history = history[history['Product'] == product]
+    p_history = history[history['Product'] == product].copy()  # Use .copy() to avoid SettingWithCopyWarning
 
-    # Compute included orders from snapshot according to inclusion rule
-    if snapshot is not None and not snapshot.empty:
-        # product start and end
-        p_start = product
-        p_end = p_start + datetime.timedelta(minutes=int(window_minutes))
+    # Compute VWAP based on the order book
+    if not p_history.empty:
+        p_history.loc[:, 'VWAP'] = (
+            (p_history['BestBid'] * p_history['BestBidQty'] + p_history['BestAsk'] * p_history['BestAskQty']) /
+            (p_history['BestBidQty'] + p_history['BestAskQty']).replace(0, float('nan'))  # Avoid division by zero
+        )
 
-        if include_fragmented:
-            # include orders that overlap the product window
-            mask = (snapshot['DeliveryStart'] < p_end) & (snapshot['DeliveryEnd'] > p_start)
-        else:
-            # include only orders that fully contain the product window
-            mask = (snapshot['DeliveryStart'] <= p_start) & (snapshot['DeliveryEnd'] >= p_end)
+    # Extract the current best bid and ask
+    curr_bid = p_history['BestBid'].iloc[-1] if not p_history.empty else None
+    curr_ask = p_history['BestAsk'].iloc[-1] if not p_history.empty else None
 
-        p_orders = snapshot.loc[mask]
-    else:
-        p_orders = pd.DataFrame()
-
-    # Get current best bid/ask from included orders
-    if not p_orders.empty:
-        bids = p_orders[p_orders['Side'] == 'BUY']
-        asks = p_orders[p_orders['Side'] == 'SELL']
-        curr_bid = bids['Price'].max() if not bids.empty else None
-        curr_ask = asks['Price'].min() if not asks.empty else None
-    else:
-        curr_bid = None
-        curr_ask = None
-        
     # Create Plotly Chart
     fig = go.Figure()
-    
+
     # We want to plot the step-line of Bid and Ask
     # We need to ensure the line continues to the current replay_time
     if not p_history.empty:
         # Add a point at replay_time with the last value to extend the line
         last_row = p_history.iloc[[-1]].copy()
-        last_row['Time'] = end_time
+        last_row.loc[:, 'Time'] = end_time
         plot_data = pd.concat([p_history, last_row])
-        
+
         fig.add_trace(go.Scatter(
             x=plot_data['Time'], 
             y=plot_data['BestBid'],
@@ -193,7 +169,7 @@ def render_chart(product, history, snapshot, window_minutes, include_fragmented,
             name='Best Bid',
             line=dict(color='green', shape='hv')
         ))
-        
+
         fig.add_trace(go.Scatter(
             x=plot_data['Time'], 
             y=plot_data['BestAsk'],
@@ -201,7 +177,16 @@ def render_chart(product, history, snapshot, window_minutes, include_fragmented,
             name='Best Ask',
             line=dict(color='red', shape='hv')
         ))
-        
+
+        # Add VWAP to the chart
+        fig.add_trace(go.Scatter(
+            x=plot_data['Time'],
+            y=plot_data['VWAP'],
+            mode='lines',
+            name='VWAP',
+            line=dict(color='blue', dash='dot')
+        ))
+
     fig.update_layout(
         yaxis=dict(range=y_range),
         title=f"Delivery: {product.strftime('%H:%M')}",
@@ -211,7 +196,7 @@ def render_chart(product, history, snapshot, window_minutes, include_fragmented,
         margin=dict(l=0, r=0, t=30, b=0),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-    
+
     st.plotly_chart(fig, width='stretch')
     
     # Display current metrics below the chart
@@ -228,7 +213,7 @@ def render_chart(product, history, snapshot, window_minutes, include_fragmented,
             display_cols = ['Price', 'Quantity', 'Side', 'DeliveryStart', 'DeliveryEnd', 'ActionCode', 'TransactionTime']
             st.dataframe(p_orders[display_cols].sort_values(['Price'], ascending=False))
         else:
-            st.write("No included orders for this delivery window.")
+            st.write("LOB empty at the end of replay time range.")
 
     st.divider()
 
@@ -247,7 +232,7 @@ def main():
     
     with st.spinner("Loading data and precomputing state..."):
         engine = load_engine()
-        
+
     min_time = engine.min_time.to_pydatetime()
     max_time = engine.max_time.to_pydatetime()
 
@@ -289,7 +274,8 @@ def main():
     for idx, product in enumerate(selected_products):
         col = cols[idx % 2]
         with col:
-            render_chart(product, history, snapshot, delivery_window_minutes, include_fragmented, y_range, end_time)
+            p_orders = snapshot[snapshot['Product'] == product] if not snapshot.empty else pd.DataFrame()
+            render_chart(product, history, snapshot, delivery_window_minutes, include_fragmented, y_range, end_time, p_orders)
 
 if __name__ == "__main__":
     main()
